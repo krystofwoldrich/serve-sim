@@ -148,11 +148,20 @@ export interface SimMiddlewareOptions {
  */
 export function simMiddleware(options?: SimMiddlewareOptions) {
   const base = (options?.basePath ?? "/.sim").replace(/\/+$/, "");
+  let urlLogged = false;
 
   return (req: any, res: any, next?: () => void) => {
     const rawUrl: string = req.url ?? "";
     const qIndex = rawUrl.indexOf("?");
     const url = qIndex === -1 ? rawUrl : rawUrl.slice(0, qIndex);
+
+    if (!urlLogged) {
+      const host = req.headers?.host;
+      if (host) {
+        urlLogged = true;
+        console.log(`[90m›[0m Simulator: [36mhttp://${host}${base || "/"}[0m`);
+      }
+    }
 
     // Serve the preview page
     if (url === base || url === base + "/") {
