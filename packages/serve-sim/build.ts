@@ -7,6 +7,8 @@
  *   dist/serve-sim         Compiled single-file executable (bun --compile)
  *   dist/middleware.js    Public subpath export "serve-sim/middleware" (ESM)
  *   dist/middleware.cjs   Thin CJS wrapper for the same
+ *   dist/metro.js         Public subpath export "serve-sim/metro" (ESM)
+ *   dist/metro.cjs        Thin CJS wrapper for the same
  *
  * The preview HTML (bundled client.tsx + Preact + serve-sim-client, base64
  * encoded) is injected into every artifact that could need to serve the UI
@@ -105,6 +107,31 @@ writeFileSync(
   `"use strict";\nmodule.exports = require("./middleware.js");\n`,
 );
 console.log("dist/middleware.cjs (wrapper)");
+
+// ─── 3b. Metro helper ESM (serve-sim/metro) ───────────────────────────────
+
+const metroResult = await Bun.build({
+  entrypoints: [resolve(root, "src/metro.ts")],
+  target: "bun",
+  format: "esm",
+  minify: true,
+  outdir: distDir,
+  external: ["fs", "path", "os", "child_process", "url"],
+  define: PREVIEW_DEFINE,
+});
+if (!metroResult.success) {
+  console.error("Metro helper build failed:");
+  for (const log of metroResult.logs) console.error(log);
+  process.exit(1);
+}
+const metroSize = (await metroResult.outputs[0].text()).length;
+console.log(`dist/metro.js     ${kb(metroSize)}`);
+
+writeFileSync(
+  resolve(distDir, "metro.cjs"),
+  `"use strict";\nmodule.exports = require("./metro.js");\n`,
+);
+console.log("dist/metro.cjs (wrapper)");
 
 // ─── 4. Bin JS bundle ────────────────────────────────────────────────────
 

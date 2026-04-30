@@ -24,7 +24,10 @@
     "dist/serve-sim.js",
     "dist/middleware.js",
     "dist/middleware.cjs",
+    "dist/metro.js",
+    "dist/metro.cjs",
     "src/middleware.ts",
+    "src/metro.ts",
     "src/state.ts",
     "bin/serve-sim-bin"
   ],
@@ -33,6 +36,11 @@
       "require": "./dist/middleware.cjs",
       "import": "./dist/middleware.js",
       "types": "./src/middleware.ts"
+    },
+    "./metro": {
+      "require": "./dist/metro.cjs",
+      "import": "./dist/metro.js",
+      "types": "./src/metro.ts"
     },
     "./state": {
       "import": "./src/state.ts",
