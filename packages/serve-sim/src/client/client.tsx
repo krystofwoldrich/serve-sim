@@ -403,7 +403,10 @@ function AppWithConfig({
   // inside `useH264Stream`.
   const [wsStreamConfig, setWsStreamConfig] = useState<StreamConfig | null>(null);
   const streamConfig = wsStreamConfig;
-  const activeStreamConfig = liveStreamConfig ?? h264.config ?? streamConfig ?? fallbackScreenSize(deviceType, selectedDevice?.name);
+  // Config actually confirmed by the live stream (Android H.264 poll or iOS WS),
+  // before falling back to a static device size.
+  const confirmedStreamConfig = h264.config ?? streamConfig;
+  const activeStreamConfig = liveStreamConfig ?? confirmedStreamConfig ?? fallbackScreenSize(deviceType, selectedDevice?.name);
   const imgBorderRadius = screenBorderRadius(deviceType, activeStreamConfig);
   const frameMaxWidth = simulatorMaxWidth(deviceType, activeStreamConfig);
   const frameAspectRatio = simulatorAspectRatio(activeStreamConfig);
@@ -514,17 +517,21 @@ function AppWithConfig({
   }, [config.streamUrl]);
 
   useEffect(() => {
-    const confirmedConfig = streamConfig;
-    if (!confirmedConfig) return;
+    if (!confirmedStreamConfig) return;
     setLiveStreamConfig((prev) =>
       prev &&
-      prev.width === confirmedConfig.width &&
-      prev.height === confirmedConfig.height &&
-      prev.orientation === confirmedConfig.orientation
+      prev.width === confirmedStreamConfig.width &&
+      prev.height === confirmedStreamConfig.height &&
+      prev.orientation === confirmedStreamConfig.orientation
         ? prev
         : null,
     );
-  }, [streamConfig, streamConfig?.width, streamConfig?.height, streamConfig?.orientation]);
+  }, [
+    confirmedStreamConfig,
+    confirmedStreamConfig?.width,
+    confirmedStreamConfig?.height,
+    confirmedStreamConfig?.orientation,
+  ]);
 
   const sendKey = useCallback((type: "down" | "up", usage: number) => {
     sendWs(0x06, { type, usage });
