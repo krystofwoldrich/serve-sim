@@ -57,6 +57,8 @@ export interface SimulatorViewProps {
   subscribeFrame?: (cb: (blobUrl: string) => void) => () => void;
   /** Relay mode: latest blob URL JPEG frame from the relay (used for initial render) */
   streamFrame?: string | null;
+  /** Relay mode: subscribe to decoded video frames. Callback must draw synchronously. */
+  subscribeVideoFrame?: (cb: (frame: any) => void) => () => void;
   /** Relay mode: screen config from relay */
   streamConfig?: StreamConfig | null;
   /** Called when the rendered stream reports new dimensions or orientation. */
@@ -103,6 +105,7 @@ export function SimulatorView({
   enableDigitalCrown,
   subscribeFrame,
   streamFrame: _streamFrame,
+  subscribeVideoFrame,
   streamConfig,
   onScreenConfigChange,
   hideControls,
@@ -111,14 +114,19 @@ export function SimulatorView({
   codec = "avcc",
 }: SimulatorViewProps) {
   const relayMode = !!onStreamTouch;
+  // When the parent decodes video itself and pushes frames via
+  // `subscribeVideoFrame` (Android H.264), paint those onto `relayCanvasRef`.
+  const videoRelayMode = relayMode && !!subscribeVideoFrame;
   // AVCC decode is independent of input relay: the H.264 pipeline only needs
   // `url`, so it runs in both direct and relay mode (input still forwards
   // through `onStreamTouch`). Falls back to the <img> when WebCodecs is
-  // unavailable or `codec="mjpeg"`.
-  const useAvcc = codec === "avcc" && isAvccSupported();
+  // unavailable or `codec="mjpeg"`. Disabled when the parent already supplies
+  // decoded video frames, so the two canvases never both drive the view.
+  const useAvcc = codec === "avcc" && isAvccSupported() && !videoRelayMode;
   const imgRef = useRef<HTMLImageElement | null>(null);
   const canvasRef = useRef<HTMLCanvasElement | null>(null);
   const relayImgRef = useRef<HTMLImageElement | null>(null);
+  const relayCanvasRef = useRef<HTMLCanvasElement | null>(null);
   const surfaceRef = useRef<HTMLDivElement | null>(null);
   const inputLayerRef = useRef<HTMLDivElement | null>(null);
   const wsRef = useRef<WebSocket | null>(null);
@@ -212,8 +220,9 @@ export function SimulatorView({
   connectedRef.current = connected;
   const prevBlobUrlRef = useRef<string | null>(null);
   useEffect(() => {
-    // AVCC paints the canvas via useAvccStream; skip the MJPEG relay <img>.
-    if (!relayMode || !subscribeFrame || useAvcc) return;
+    // AVCC paints `canvasRef` (useAvccStream) and the H.264 video relay paints
+    // `relayCanvasRef`; either way, skip the MJPEG relay <img>.
+    if (!relayMode || !subscribeFrame || useAvcc || videoRelayMode) return;
     // Startup watchdog: flag the stream as broken if no frame arrives within
     // the window. Catches the silent-failure mode where the helper accepts
     // the MJPEG connection but its underlying simulator was shut down —
@@ -250,7 +259,7 @@ export function SimulatorView({
         prevBlobUrlRef.current = null;
       }
     };
-  }, [relayMode, subscribeFrame, useAvcc]);
+  }, [relayMode, subscribeFrame, useAvcc, videoRelayMode]);
 
   // AVCC (H.264) decode → canvas. Inert unless `useAvcc`. Works in both
   // direct and relay mode (it only needs `url`).
@@ -279,6 +288,43 @@ export function SimulatorView({
     onFrame: onAvccFrame,
     onError: setError,
   });
+
+  // H.264 video relay (Android): parent decodes, we paint onto relayCanvasRef.
+  useEffect(() => {
+    if (!videoRelayMode || !subscribeVideoFrame) return;
+    const STARTUP_MS = 6000;
+    const watchdog = setTimeout(() => {
+      if (!connectedRef.current) {
+        setError("Stream is not producing frames. The simulator may have stopped — try reconnecting.");
+      }
+    }, STARTUP_MS);
+
+    const unsubscribe = subscribeVideoFrame((frame) => {
+      const width = Number(frame.displayWidth || frame.codedWidth || 0);
+      const height = Number(frame.displayHeight || frame.codedHeight || 0);
+      const canvas = relayCanvasRef.current;
+      const ctx = canvas?.getContext("2d", { alpha: false });
+      if (!canvas || !ctx || width <= 0 || height <= 0) return;
+
+      if (canvas.width !== width) canvas.width = width;
+      if (canvas.height !== height) canvas.height = height;
+      ctx.drawImage(frame, 0, 0, width, height);
+      updateScreenConfig({ width, height });
+
+      frameCountRef.current++;
+      lastFrameAtRef.current = Date.now();
+      if (!connectedRef.current) {
+        clearTimeout(watchdog);
+        setConnected(true);
+        setError(null);
+      }
+    });
+
+    return () => {
+      clearTimeout(watchdog);
+      unsubscribe?.();
+    };
+  }, [videoRelayMode, subscribeVideoFrame, updateScreenConfig]);
 
   const sendTouch = useCallback(
     (touch: {
@@ -502,8 +548,9 @@ export function SimulatorView({
 
   const getViewElement = useCallback(() => {
     if (useAvcc) return canvasRef.current;
+    if (videoRelayMode) return relayCanvasRef.current;
     return relayMode ? relayImgRef.current : imgRef.current;
-  }, [relayMode, useAvcc]);
+  }, [relayMode, useAvcc, videoRelayMode]);
 
   const getInputRect = useCallback(() => {
     return surfaceRef.current?.getBoundingClientRect()
@@ -775,29 +822,35 @@ export function SimulatorView({
             style={relayMode ? { display: "none" } : streamImageStyle}
           />
         )}
-        {relayMode && !useAvcc && (
-          <img
-            ref={relayImgRef}
-            draggable={false}
-            onLoad={(e) => {
-              const el = e.currentTarget;
-              if (el.naturalWidth > 0 && el.naturalHeight > 0) {
-                updateScreenConfig({ width: el.naturalWidth, height: el.naturalHeight });
-              }
+        {relayMode && !useAvcc && !videoRelayMode && (
+            <img
+              ref={relayImgRef}
+              draggable={false}
+              onLoad={(e) => {
+                const el = e.currentTarget;
+                if (el.naturalWidth > 0 && el.naturalHeight > 0) {
+                  updateScreenConfig({ width: el.naturalWidth, height: el.naturalHeight });
+                }
+              }}
+              style={streamImageStyle}
+            />
+          )}
+          {videoRelayMode && (
+            <canvas
+              ref={relayCanvasRef}
+              style={streamImageStyle}
+            />
+          )}
+          {/* Interactive overlay — captures all pointer events */}
+          <div
+            ref={inputLayerRef}
+            style={{
+              position: "absolute",
+              inset: 0,
+              cursor: FINGER_CURSOR,
+              touchAction: "none",
             }}
-            style={streamImageStyle}
-          />
-        )}
-        {/* Interactive overlay — captures all pointer events */}
-        <div
-          ref={inputLayerRef}
-          style={{
-            position: "absolute",
-            inset: 0,
-            cursor: FINGER_CURSOR,
-            touchAction: "none",
-          }}
-          onMouseDown={(e) => {
+            onMouseDown={(e) => {
             e.preventDefault();
             const rect = getInputRect();
             if (!rect) return;

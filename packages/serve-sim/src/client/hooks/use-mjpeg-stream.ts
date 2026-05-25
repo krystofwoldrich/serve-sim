@@ -8,7 +8,7 @@ import { useCallback, useEffect, useRef } from "react";
  * Screen config (dimensions / orientation) is no longer polled here — it
  * arrives over the input WebSocket — so this hook only deals with frame bytes.
  */
-export function useMjpegStream(streamUrl: string | null) {
+export function useMjpegStream(streamUrl: string | null, enabled = true) {
   const subscribersRef = useRef<Set<(blobUrl: string) => void>>(new Set());
 
   const subscribeFrame = useCallback(
@@ -20,7 +20,9 @@ export function useMjpegStream(streamUrl: string | null) {
   );
 
   useEffect(() => {
-    if (!streamUrl) return;
+    if (!enabled || !streamUrl) {
+      return;
+    }
     const controller = new AbortController();
     let stopped = false;
     let retryTimer: ReturnType<typeof setTimeout> | null = null;
@@ -49,6 +51,32 @@ export function useMjpegStream(streamUrl: string | null) {
         }
 
         let buffer = new Uint8Array(0);
+        const headerTerminator = new TextEncoder().encode("\r\n\r\n");
+
+        const indexOfBytes = (haystack: Uint8Array, needle: Uint8Array) => {
+          outer:
+          for (let i = 0; i <= haystack.length - needle.length; i++) {
+            for (let j = 0; j < needle.length; j++) {
+              if (haystack[i + j] !== needle[j]) continue outer;
+            }
+            return i;
+          }
+          return -1;
+        };
+
+        const emitFrame = (bytes: Uint8Array, type: string) => {
+          const copy: Uint8Array<ArrayBuffer> = new Uint8Array(bytes.length);
+          copy.set(bytes);
+          const blob = new Blob([copy], { type });
+          const blobUrl = URL.createObjectURL(blob);
+          if (subscribersRef.current.size === 0) {
+            URL.revokeObjectURL(blobUrl);
+            return;
+          }
+          for (const cb of subscribersRef.current) {
+            cb(blobUrl);
+          }
+        };
 
         while (true) {
           const { done, value } = await reader.read();
@@ -60,9 +88,28 @@ export function useMjpegStream(streamUrl: string | null) {
           newBuf.set(value, buffer.length);
           buffer = newBuf;
 
-          // Look for JPEG frames: find Content-Length or JPEG markers (FFD8...FFD9)
-          // Simpler approach: split on boundary markers and extract JPEG data
+          // Prefer the multipart headers so Android's PNG screencap stream
+          // and iOS's JPEG stream share the same client path.
           while (true) {
+            const headerEnd = indexOfBytes(buffer, headerTerminator);
+            if (headerEnd !== -1) {
+              const header = new TextDecoder().decode(buffer.slice(0, headerEnd));
+              const length = Number(/Content-Length:\s*(\d+)/i.exec(header)?.[1]);
+              if (Number.isFinite(length) && length > 0) {
+                const frameStart = headerEnd + headerTerminator.length;
+                const frameEnd = frameStart + length;
+                if (buffer.length < frameEnd) break;
+                const contentType =
+                  /Content-Type:\s*([^\r\n]+)/i.exec(header)?.[1]?.trim() || "image/jpeg";
+                emitFrame(buffer.slice(frameStart, frameEnd), contentType);
+                buffer = buffer.slice(frameEnd);
+                continue;
+              }
+              buffer = buffer.slice(headerEnd + headerTerminator.length);
+              continue;
+            }
+
+            // Fallback for older helpers: find JPEG markers (FFD8...FFD9).
             // Find first JPEG start (FF D8)
             let jpegStart = -1;
             for (let i = 0; i < buffer.length - 1; i++) {
@@ -87,15 +134,7 @@ export function useMjpegStream(streamUrl: string | null) {
             const jpeg = buffer.slice(jpegStart, jpegEnd);
             buffer = buffer.slice(jpegEnd);
 
-            const blob = new Blob([jpeg], { type: "image/jpeg" });
-            const blobUrl = URL.createObjectURL(blob);
-            if (subscribersRef.current.size === 0) {
-              URL.revokeObjectURL(blobUrl);
-              continue;
-            }
-            for (const cb of subscribersRef.current) {
-              cb(blobUrl);
-            }
+            emitFrame(jpeg, "image/jpeg");
           }
         }
       } catch {
@@ -111,7 +150,7 @@ export function useMjpegStream(streamUrl: string | null) {
       if (retryTimer) clearTimeout(retryTimer);
       controller.abort();
     };
-  }, [streamUrl]);
+  }, [enabled, streamUrl]);
 
   return { subscribeFrame, frame: null };
 }

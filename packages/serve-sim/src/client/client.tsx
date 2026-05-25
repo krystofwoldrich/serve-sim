@@ -34,6 +34,7 @@ import { SimulatorResizeSizeBadge } from "./components/simulator-resize-size-bad
 import { ToolsPanel } from "./components/tools-panel";
 import { WebKitDevtoolsPanel } from "./components/webkit-devtools-panel";
 import { useMediaDrop } from "./hooks/use-media-drop";
+import { useH264Stream } from "./hooks/use-h264-stream";
 import { useMjpegStream } from "./hooks/use-mjpeg-stream";
 import { useAvccStream } from "./hooks/use-avcc-stream";
 import { useResizableWidth } from "./hooks/use-resizable-width";
@@ -102,6 +103,20 @@ function App() {
     setDevicesLoading(true);
     setDevicesError(null);
     try {
+      const gridRes = await fetch(simEndpoint("grid/api"), { cache: "no-store" });
+      if (gridRes.ok) {
+        const grid = await gridRes.json() as {
+          devices?: Array<{ device: string; platform?: "ios" | "android"; name: string; state: string; runtime: string }>;
+        };
+        setDevices((grid.devices ?? []).map((d) => ({
+          udid: d.device,
+          platform: d.platform ?? "ios",
+          name: d.name,
+          state: d.state,
+          runtime: d.runtime,
+        })));
+        return;
+      }
       const res = await execOnHost("xcrun simctl list devices available -j");
       if (res.exitCode !== 0) throw new Error(res.stderr || "simctl list failed");
       setDevices(parseSimctlList(res.stdout));
@@ -287,13 +302,23 @@ function AppWithConfig({
   setStreaming,
   fetchDevices,
 }: AppWithConfigProps) {
-  const selectedDevice = devices.find((d) => d.udid === config.device) ?? null;
+  const selectedDevice = devices.find((d) => d.udid === config.device) ?? (
+    config.name
+      ? {
+          udid: config.device,
+          platform: config.platform ?? "ios",
+          name: config.name,
+          runtime: config.runtime ?? (config.platform === "android" ? "Android" : ""),
+          state: "Booted",
+        }
+      : null
+  );
 
   useEffect(() => {
     document.title = selectedDevice?.name
-      ? `Simulator - ${selectedDevice.name}`
-      : "Simulator Preview";
-  }, [selectedDevice?.name]);
+      ? `${selectedDevice.platform === "android" ? "Android" : "Simulator"} - ${selectedDevice.name}`
+      : "Device Preview";
+  }, [selectedDevice?.name, selectedDevice?.platform]);
 
   const deviceType: DeviceType = getDeviceType(selectedDevice?.name);
   const devtools = useWebKitDevtools(config.devtoolsEndpoint ?? simEndpoint("devtools"), devtoolsOpen);
@@ -308,25 +333,31 @@ function AppWithConfig({
     setSelectedDevtoolsTargetId(null);
   }, [config.device, setSelectedDevtoolsTargetId]);
 
-  // Prefer H.264 (AVCC via WebCodecs) when the browser supports it; otherwise
-  // fall back to MJPEG. The MJPEG reader stays dormant (null url) under AVCC so
-  // we never pull both streams at once. The AVCC frames are decoded view-side
-  // by SimulatorView's `useAvccStream`; this hook just reports browser support.
-  //
-  // Browser support is necessary but not sufficient: the helper may not serve
-  // `/stream.avcc` at all. A device started from the UI is spawned via
-  // `bunx serve-sim --detach`, which runs the published `serve-sim` — older
-  // versions predate H.264 and 404 the endpoint (cross-origin that 404 is
-  // opaque to fetch, so "no frame arrived" is the only reliable signal).
-  // `avccFallback` drives a startup timeout: if AVCC paints nothing in time,
-  // drop to MJPEG, which every helper serves. See avcc-fallback.ts.
+  // Two hardware-video paths, one per platform:
+  //  - iOS: H.264 over `/stream.avcc` (AVCC via WebCodecs), decoded view-side by
+  //    SimulatorView's `useAvccStream`; `useAvccStream` here only reports browser
+  //    support. Helper support is necessary but not sufficient — a device started
+  //    from the UI runs the published `serve-sim`, and older versions predate
+  //    H.264 and 404 `/stream.avcc` (cross-origin that 404 is opaque to fetch, so
+  //    "no frame arrived" is the only reliable signal). `avccFallback` drives a
+  //    startup timeout: if AVCC paints nothing in time, drop to MJPEG, which
+  //    every helper serves. See avcc-fallback.ts.
+  //  - Android: H.264 over `/stream.h264` decoded view-side by `useH264Stream`.
+  // MJPEG stays dormant (null url) whenever a hardware-video path is active so we
+  // never pull two streams at once.
+  const androidVideoEnabled = config.platform === "android";
   const avcc = useAvccStream();
   const [avccFallback, dispatchAvccFallback] = useReducer(
     avccFallbackReducer,
     initialAvccFallback,
   );
-  const useAvccVideo = avcc.supported && !avccFallback.fellBack;
-  const mjpeg = useMjpegStream(useAvccVideo ? null : config.streamUrl);
+  const useAvccVideo = !androidVideoEnabled && avcc.supported && !avccFallback.fellBack;
+  const h264 = useH264Stream(config.streamUrl, androidVideoEnabled);
+  const androidVideoActive = androidVideoEnabled && h264.supported !== false;
+  const mjpeg = useMjpegStream(
+    config.streamUrl,
+    !useAvccVideo && !androidVideoActive,
+  );
 
   // Re-arm AVCC whenever the target stream changes (device switch / reconnect).
   useEffect(() => {
@@ -348,11 +379,12 @@ function AppWithConfig({
     return () => clearTimeout(timer);
   }, [useAvccVideo, config.streamUrl]);
   const [liveStreamConfig, setLiveStreamConfig] = useState<StreamConfig | null>(null);
-  // Screen config now arrives over the input WebSocket (pushed by the helper on
-  // connect + on every dimension/orientation change) instead of a 1s /config poll.
+  // Screen config: iOS arrives over the input WebSocket (pushed by the helper on
+  // connect + on every dimension/orientation change); Android polls `/config`
+  // inside `useH264Stream`.
   const [wsStreamConfig, setWsStreamConfig] = useState<StreamConfig | null>(null);
   const streamConfig = wsStreamConfig;
-  const activeStreamConfig = liveStreamConfig ?? streamConfig ?? fallbackScreenSize(deviceType, selectedDevice?.name);
+  const activeStreamConfig = liveStreamConfig ?? h264.config ?? streamConfig ?? fallbackScreenSize(deviceType, selectedDevice?.name);
   const imgBorderRadius = screenBorderRadius(deviceType, activeStreamConfig);
   const frameMaxWidth = simulatorMaxWidth(deviceType, activeStreamConfig);
   const frameAspectRatio = simulatorAspectRatio(activeStreamConfig);
@@ -592,7 +624,7 @@ function AppWithConfig({
         }
         return;
       }
-      if (e.code === "KeyA" && e.metaKey && e.shiftKey) {
+      if ((config.platform ?? "ios") === "ios" && e.code === "KeyA" && e.metaKey && e.shiftKey) {
         e.preventDefault();
         if (type === "down" && !e.repeat) {
           execOnHost(`xcrun simctl ui ${config.device} appearance`).then((r) => {
@@ -617,19 +649,22 @@ function AppWithConfig({
       window.removeEventListener("keydown", down);
       window.removeEventListener("keyup", up);
     };
-  }, [sendWs, config.device, rotateBy]);
+  }, [sendWs, config.device, config.platform, rotateBy]);
 
   const switchToDevice = useCallback(async (d: SimDevice) => {
     if (switching || d.udid === config.device) return;
     setSwitching(true);
     try {
-      if (d.state !== "Booted") {
-        await execOnHost(`xcrun simctl boot ${d.udid}`);
-      }
-      const detach = await execOnHost(`bunx serve-sim --detach ${d.udid}`);
-      if (detach.exitCode !== 0) throw new Error(detach.stderr || "Failed to start serve-sim");
+      const startEndpoint = window.__SIM_PREVIEW__?.gridStartEndpoint ?? simEndpoint("grid/api/start");
+      const res = await fetch(startEndpoint, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ udid: d.udid, platform: d.platform ?? "ios" }),
+      });
+      const json = await res.json().catch(() => ({}));
+      if (!res.ok || !json.ok) throw new Error(json.error || "Failed to start serve-sim");
       const nextUrl = new URL(window.location.href);
-      nextUrl.searchParams.set("device", d.udid);
+      nextUrl.searchParams.set("device", json.device ?? d.udid);
       window.location.assign(nextUrl.toString());
     } catch {
       setSwitching(false);
@@ -640,6 +675,7 @@ function AppWithConfig({
   const mediaDrop = useMediaDrop({
     exec: execOnHost,
     udid: config.device,
+    platform: config.platform ?? "ios",
     enabled: streaming,
     onUploadStart: uploads.add,
     onUploadProgress: uploads.setProgress,
@@ -657,7 +693,13 @@ function AppWithConfig({
   const stopDevice = useCallback(async (udid: string) => {
     setStoppingUdids((prev) => new Set(prev).add(udid));
     try {
-      await execOnHost(`xcrun simctl shutdown ${udid}`);
+      const device = devices.find((d) => d.udid === udid);
+      const shutdownEndpoint = window.__SIM_PREVIEW__?.gridShutdownEndpoint ?? simEndpoint("grid/api/shutdown");
+      await fetch(shutdownEndpoint, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ udid, platform: device?.platform ?? "ios" }),
+      });
       await fetchDevices();
     } finally {
       setStoppingUdids((prev) => {
@@ -666,7 +708,7 @@ function AppWithConfig({
         return next;
       });
     }
-  }, [fetchDevices, setStoppingUdids]);
+  }, [devices, fetchDevices, setStoppingUdids]);
 
   const simulatorResize = useSimulatorResize({
     defaultWidth: frameMaxWidth,
@@ -803,8 +845,9 @@ function AppWithConfig({
             onStreamButton={onStreamButton}
             onStreamDigitalCrown={onStreamDigitalCrown}
             codec={useAvccVideo ? "avcc" : "mjpeg"}
-            subscribeFrame={useAvccVideo ? undefined : mjpeg.subscribeFrame}
-            streamFrame={useAvccVideo ? undefined : mjpeg.frame}
+            subscribeFrame={useAvccVideo || androidVideoActive ? undefined : mjpeg.subscribeFrame}
+            subscribeVideoFrame={androidVideoActive ? h264.subscribeVideoFrame : undefined}
+            streamFrame={useAvccVideo || androidVideoActive ? undefined : mjpeg.frame}
             streamConfig={activeStreamConfig}
             enableDigitalCrown={deviceType === "watch"}
             onScreenConfigChange={onScreenConfigChange}
@@ -820,7 +863,7 @@ function AppWithConfig({
                 <polyline points="17 8 12 3 7 8" />
                 <line x1="12" y1="3" x2="12" y2="15" />
               </svg>
-              <span className="text-[13px] font-medium">Drop media or .ipa</span>
+              <span className="text-[13px] font-medium">Drop media or {config.platform === "android" ? ".apk" : ".ipa"}</span>
             </div>
           )}
           <SimulatorResizeCornerHandle
@@ -869,9 +912,9 @@ function AppWithConfig({
                     {isUploading && transferring &&
                       `Uploading ${t.name}… ${pct}%`}
                     {isUploading && !transferring &&
-                      (t.kind === "ipa" ? `Installing ${t.name}…` : `Adding ${t.name}…`)}
+                      (t.kind === "ipa" || t.kind === "apk" ? `Installing ${t.name}…` : `Adding ${t.name}…`)}
                     {t.status === "success" &&
-                      (t.kind === "ipa" ? `Installed ${t.name}` : `Added ${t.name} to Photos`)}
+                      (t.kind === "ipa" || t.kind === "apk" ? `Installed ${t.name}` : `Added ${t.name}`)}
                     {isError && `${t.name}: ${t.message ?? "Upload failed"}`}
                   </span>
                 </div>
@@ -937,9 +980,9 @@ function AppWithConfig({
             setGridOpen((o) => !o);
           }}
           className="w-[30px] h-[30px] flex items-center justify-center bg-transparent border-none rounded-md text-[#8e8e93] cursor-pointer [transition:background_0.15s_ease,color_0.15s_ease] hover:bg-white/8 hover:text-white"
-          aria-label="Open simulator grid"
+          aria-label="Open device grid"
           aria-pressed={gridOpen}
-          title="Simulators"
+          title="Devices"
         >
           <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.75" strokeLinecap="round" strokeLinejoin="round">
             <rect x="3" y="3" width="7" height="7" rx="1.5" />
