@@ -716,27 +716,71 @@ export async function runAndroidHelper({
     });
   });
 
-  await new Promise<void>((resolve, reject) => {
+  // Node's http server fully handles every route on both runtimes, but Bun's
+  // node:http layer silently drops the raw 101 written when manually hijacking
+  // an "upgrade" socket, so the WebSocket handshake never completes (taps,
+  // gestures, buttons, and orientation all travel over /ws). Under Bun we bind
+  // the node server to an internal loopback port and put a Bun.serve in front:
+  // it performs the WS upgrade natively and proxies every other request through
+  // to the node server untouched, leaving the proven streaming path alone.
+  const bunRuntime = (globalThis as { Bun?: any }).Bun;
+  const internalHost = bunRuntime ? "127.0.0.1" : "0.0.0.0";
+  const internalPort = bunRuntime ? 0 : port;
+
+  const boundPort = await new Promise<number>((resolve, reject) => {
     server.once("error", reject);
-    server.listen(port, "0.0.0.0", () => {
+    server.listen(internalPort, internalHost, () => {
       server.off("error", reject);
-      console.log(`[server] Listening on http://0.0.0.0:${port}`);
-      resolve();
+      const addr = server.address();
+      resolve(typeof addr === "object" && addr ? addr.port : port);
     });
   });
 
-  process.on("SIGINT", () => {
+  let bunServer: { stop: (closeActive?: boolean) => void } | null = null;
+  if (bunRuntime) {
+    bunServer = bunRuntime.serve({
+      port,
+      hostname: "0.0.0.0",
+      idleTimeout: 0,
+      fetch(req: Request, srv: { upgrade: (r: Request) => boolean }) {
+        const u = new URL(req.url);
+        if (u.pathname === "/ws") {
+          if (srv.upgrade(req)) return undefined;
+          return new Response("WebSocket upgrade failed", { status: 400 });
+        }
+        const hasBody = req.method !== "GET" && req.method !== "HEAD";
+        return fetch(`http://127.0.0.1:${boundPort}${u.pathname}${u.search}`, {
+          method: req.method,
+          headers: req.headers,
+          body: hasBody ? req.body : undefined,
+          signal: req.signal,
+          // @ts-expect-error Bun streams the proxied request body.
+          duplex: hasBody ? "half" : undefined,
+        });
+      },
+      websocket: {
+        idleTimeout: 0,
+        message(_ws: unknown, message: string | ArrayBuffer | Uint8Array) {
+          try {
+            handleMessage(Buffer.from(message as ArrayBuffer));
+          } catch (err) {
+            console.error("[android-ws]", err instanceof Error ? err.message : err);
+          }
+        },
+      },
+    });
+  }
+  console.log(`[server] Listening on http://0.0.0.0:${port}`);
+
+  const shutdown = () => {
     stopped = true;
     inputShell.stop();
+    bunServer?.stop(true);
     server.close();
     process.exit(0);
-  });
-  process.on("SIGTERM", () => {
-    stopped = true;
-    inputShell.stop();
-    server.close();
-    process.exit(0);
-  });
+  };
+  process.on("SIGINT", shutdown);
+  process.on("SIGTERM", shutdown);
 
   await new Promise(() => {});
 }
